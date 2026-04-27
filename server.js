@@ -1,62 +1,54 @@
 const express = require("express");
 const QRCode = require("qrcode");
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
 
 const app = express();
 app.use(express.json());
 
 let sock;
-let qrCodeBase64 = null;
+let currentQR = null;
 
-async function start() {
+async function startSession() {
   const { state, saveCreds } = await useMultiFileAuthState("auth");
 
-  sock = makeWASocket({
-    auth: state
-  });
+  sock = makeWASocket({ auth: state });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    const { qr } = update;
 
     if (qr) {
-      qrCodeBase64 = await QRCode.toDataURL(qr);
-    }
-
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-
-      if (shouldReconnect) start();
-    } else if (connection === "open") {
-      qrCodeBase64 = null;
-      console.log("✅ Conectado");
+      currentQR = await QRCode.toDataURL(qr);
+      console.log("QR atualizado");
     }
   });
 }
 
-start();
+// 👉 endpoint que o Lovable espera
+app.post("/session/start", async (req, res) => {
+  await startSession();
 
-app.get("/qr", (req, res) => {
-  if (!qrCodeBase64) return res.send("Sem QR ou já conectado");
-  res.send(`<img src="${qrCodeBase64}" />`);
+  setTimeout(() => {
+    res.json({ qr: currentQR });
+  }, 2000);
 });
 
+// 👉 endpoint padrão Lovable
 app.post("/send", async (req, res) => {
-  const { numero, mensagem } = req.body;
+  const { phone, message } = req.body;
 
   try {
-    await sock.sendMessage(numero + "@s.whatsapp.net", {
-      text: mensagem
+    await sock.sendMessage(phone + "@s.whatsapp.net", {
+      text: message
     });
 
-    res.send({ status: "ok" });
+    res.json({ status: "enviado" });
   } catch (err) {
-    res.status(500).send({ erro: err.message });
+    res.status(500).json({ erro: err.message });
   }
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("Rodando...");
+  console.log("Servidor rodando...");
 });
