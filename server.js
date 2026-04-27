@@ -161,35 +161,53 @@ app.post("/logout", requireAuth, async (req, res) => {
   }
 });
 
-// Send — protegido, com validação onWhatsApp e timeouts internos
-app.post("/send", requireAuth, async (req, res) => {
+// ---------- Send (substitua o app.post("/send", ...) atual) ----------
+app.post("/send", auth, async (req, res) => {
   try {
-    const { to, phone, message } = req.body || {};
-    const target = to || phone;
+    const { to, message } = req.body;
+    if (!sock || !isConnected) {
+      return res.status(400).json({ ok: false, error: "not connected" });
+    }
+    if (!to || !message) {
+      return res.status(400).json({ ok: false, error: "to and message required" });
+    }
 
-    if (!target || !message) {
+    // 1) Normaliza número: só dígitos
+    let digits = String(to).replace(/\D/g, "");
+
+    // 2) Se for BR (55) e tiver 12 dígitos (55 + DDD + 8), adiciona o "9"
+    //    Ex: 5511964195002 (13) já está ok; 551196419502 (12) -> 5511996419502
+    if (digits.startsWith("55") && digits.length === 12) {
+      digits = digits.slice(0, 4) + "9" + digits.slice(4);
+    }
+
+    // 3) Pergunta ao WhatsApp se esse número EXISTE de verdade
+    const [check] = await sock.onWhatsApp(digits);
+    if (!check?.exists) {
+      console.log(`❌ Número ${digits} não está no WhatsApp`);
       return res.status(400).json({
         ok: false,
-        error: "Campos obrigatórios: to (ou phone) e message",
+        error: "Número não está no WhatsApp",
+        checked: digits,
       });
     }
 
-    if (!sock || connectionState !== "connected") {
-      return res.status(503).json({
-        ok: false,
-        error: `WhatsApp não conectado (estado: ${connectionState}). Escaneie o QR Code.`,
-      });
-    }
+    // 4) Usa o JID retornado pelo onWhatsApp (formato oficial)
+    const jid = check.jid;
+    const sent = await sock.sendMessage(jid, { text: message });
+    console.log(`✅ Mensagem enviada para ${jid} (id: ${sent?.key?.id})`);
 
-    const digits = normalizePhone(target);
-    if (!digits) {
-      return res.status(400).json({
-        ok: false,
-        error: `Número inválido: "${target}". Use DDI+DDD+número (ex: 5511999998888).`,
-      });
-    }
+    res.json({
+      ok: true,
+      to: jid,
+      messageId: sent?.key?.id,
+    });
+  } catch (err) {
+    console.error("❌ Erro ao enviar:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-    const jid = `${digits}@s.whatsapp.net`;
 
     // Valida se o número existe no WhatsApp (timeout 10s)
     let exists = false;
