@@ -1,31 +1,68 @@
 const express = require("express");
 const QRCode = require("qrcode");
-const { default: makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require("@whiskeysockets/baileys");
 
 const app = express();
 app.use(express.json());
 
+const PORT = process.env.PORT || 3000;
+const TOKEN = process.env.BRIDGE_TOKEN;
+
 let sock;
 let currentQR = null;
+let isConnected = false;
 
 async function startSession() {
   const { state, saveCreds } = await useMultiFileAuthState("auth");
 
-  sock = makeWASocket({ auth: state });
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false
+  });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
-    const { qr } = update;
+    const { connection, qr, lastDisconnect } = update;
 
     if (qr) {
       currentQR = await QRCode.toDataURL(qr);
-      console.log("QR atualizado");
+      console.log("QR gerado");
+    }
+
+    if (connection === "open") {
+      isConnected = true;
+      console.log("WhatsApp conectado");
+    }
+
+    if (connection === "close") {
+      isConnected = false;
+
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
+      if (shouldReconnect) {
+        console.log("Reconectando...");
+        startSession();
+      }
     }
   });
 }
 
-// 👉 endpoint que o Lovable espera
+// 🔐 Middleware de segurança
+app.use((req, res, next) => {
+  const token = req.headers["authorization"];
+  if (token !== TOKEN) {
+    return res.status(401).json({ error: "Não autorizado" });
+  }
+  next();
+});
+
+// 📲 Start session (gera QR)
 app.post("/session/start", async (req, res) => {
   await startSession();
 
@@ -34,7 +71,7 @@ app.post("/session/start", async (req, res) => {
   }, 2000);
 });
 
-// 👉 endpoint padrão Lovable
+// 📩 Enviar mensagem
 app.post("/send", async (req, res) => {
   const { phone, message } = req.body;
 
@@ -49,6 +86,13 @@ app.post("/send", async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3000, () => {
+// 🔍 Status
+app.get("/status", (req, res) => {
+  res.json({
+    conectado: isConnected
+  });
+});
+
+app.listen(PORT, () => {
   console.log("Servidor rodando...");
 });
