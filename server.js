@@ -1,4 +1,5 @@
 const express = require("express");
+const fs = require("fs/promises");
 const QRCode = require("qrcode");
 const {
   default: makeWASocket,
@@ -11,8 +12,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.BRIDGE_TOKEN;
+const AUTH_DIR = "auth";
 
-let sock;
+let sock = null;
 let currentQR = null;
 let isConnected = false;
 let phoneNumber = null;
@@ -21,45 +23,46 @@ let starting = false;
 async function startSession() {
   if (starting) return;
   starting = true;
+  console.log("🚀 Iniciando sessão Baileys…");
 
-  const { state, saveCreds } = await useMultiFileAuthState("auth");
-
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-  });
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  sock = makeWASocket({ auth: state, printQRInTerminal: false });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, qr, lastDisconnect } = update;
+    console.log("connection.update:", { connection, hasQr: !!qr });
 
     if (qr) {
       currentQR = await QRCode.toDataURL(qr);
-      console.log("QR gerado");
+      console.log("📱 QR gerado");
     }
 
     if (connection === "open") {
       isConnected = true;
       currentQR = null;
       phoneNumber = sock.user?.id?.split(":")[0] ?? null;
-      console.log("WhatsApp conectado:", phoneNumber);
+      console.log("✅ WhatsApp conectado:", phoneNumber);
     }
 
     if (connection === "close") {
       isConnected = false;
       starting = false;
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      console.log("❌ Desconectado, code=", code, "reconnect=", shouldReconnect);
       if (shouldReconnect) {
-        console.log("Reconectando...");
-        startSession();
+        setTimeout(() => startSession(), 2000);
+      } else {
+        currentQR = null;
+        phoneNumber = null;
       }
     }
   });
 }
 
-// 🔐 Auth middleware — aceita "Bearer <token>"
+// 🔐 Auth — aceita "Bearer <token>"
 function auth(req, res, next) {
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : header;
@@ -69,16 +72,14 @@ function auth(req, res, next) {
   next();
 }
 
-// Healthcheck público (sem auth) — pra Railway saber que está vivo
-app.get("/", (req, res) => res.json({ ok: true }));
+app.get("/", (_req, res) => res.json({ ok: true }));
 
-// 📲 Start session (gera QR)
 app.post("/session/start", auth, async (req, res) => {
   if (!sock) await startSession();
 
-  // espera até 8s pelo QR ou pela conexão
+  // espera até 12s pelo QR ou pela conexão
   const start = Date.now();
-  while (!currentQR && !isConnected && Date.now() - start < 8000) {
+  while (!currentQR && !isConnected && Date.now() - start < 12000) {
     await new Promise((r) => setTimeout(r, 300));
   }
 
@@ -89,7 +90,25 @@ app.post("/session/start", auth, async (req, res) => {
   });
 });
 
-// 📩 Enviar mensagem
+// 🔄 Reset — apaga auth/ e força nova sessão (gera QR novo)
+app.post("/session/reset", auth, async (_req, res) => {
+  try {
+    if (sock) {
+      try { await sock.logout(); } catch (e) { /* ignore */ }
+      sock = null;
+    }
+    await fs.rm(AUTH_DIR, { recursive: true, force: true });
+    currentQR = null;
+    isConnected = false;
+    phoneNumber = null;
+    starting = false;
+    setTimeout(() => startSession(), 500);
+    res.json({ ok: true, message: "Sessão resetada — gerando novo QR" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/send", auth, async (req, res) => {
   const { phone, message } = req.body;
   if (!sock || !isConnected) {
@@ -103,8 +122,7 @@ app.post("/send", auth, async (req, res) => {
   }
 });
 
-// 🔍 Status
-app.get("/status", auth, (req, res) => {
+app.get("/status", auth, (_req, res) => {
   res.json({
     connected: isConnected,
     phone: phoneNumber,
@@ -113,5 +131,6 @@ app.get("/status", auth, (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("Servidor rodando na porta", PORT);
+  console.log("🚀 Bridge rodando na porta", PORT);
+  startSession().catch(console.error);
 });
