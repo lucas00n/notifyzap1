@@ -1,18 +1,15 @@
-const express = require("express");
-const fs = require("fs/promises");
-const QRCode = require("qrcode");
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-} = require("@whiskeysockets/baileys");
+import express from "express";
+import { makeWASocket, useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
+import QRCode from "qrcode";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const TOKEN = process.env.BRIDGE_TOKEN;
-const AUTH_DIR = "auth";
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "123456";
+const AUTH_DIR = path.resolve("./auth");
 
 let sock = null;
 let currentQR = null;
@@ -20,117 +17,166 @@ let isConnected = false;
 let phoneNumber = null;
 let starting = false;
 
-async function startSession() {
-  if (starting) return;
-  starting = true;
-  console.log("🚀 Iniciando sessão Baileys…");
-
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  sock = makeWASocket({ auth: state, printQRInTerminal: false });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, qr, lastDisconnect } = update;
-    console.log("connection.update:", { connection, hasQr: !!qr });
-
-    if (qr) {
-      currentQR = await QRCode.toDataURL(qr);
-      console.log("📱 QR gerado");
-    }
-
-    if (connection === "open") {
-      isConnected = true;
-      currentQR = null;
-      phoneNumber = sock.user?.id?.split(":")[0] ?? null;
-      console.log("✅ WhatsApp conectado:", phoneNumber);
-    }
-
-    if (connection === "close") {
-      isConnected = false;
-      starting = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      console.log("❌ Desconectado, code=", code, "reconnect=", shouldReconnect);
-      if (shouldReconnect) {
-        setTimeout(() => startSession(), 2000);
-      } else {
-        currentQR = null;
-        phoneNumber = null;
-      }
-    }
-  });
-}
-
-// 🔐 Auth — aceita "Bearer <token>"
-function auth(req, res, next) {
-  const header = req.headers["authorization"] || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : header;
-  if (!TOKEN || token !== TOKEN) {
+// ---------- Middleware de auth ----------
+function checkAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (token !== AUTH_TOKEN) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
-app.get("/", (_req, res) => res.json({ ok: true }));
-
-app.post("/session/start", auth, async (req, res) => {
-  if (!sock) await startSession();
-
-  // espera até 12s pelo QR ou pela conexão
-  const start = Date.now();
-  while (!currentQR && !isConnected && Date.now() - start < 12000) {
-    await new Promise((r) => setTimeout(r, 300));
+// ---------- Inicialização do Baileys ----------
+async function startSock() {
+  if (starting) {
+    console.log("[startSock] já está iniciando, ignorando chamada duplicada");
+    return;
   }
+  starting = true;
 
+  try {
+    if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      browser: ["NotifyZap", "Chrome", "1.0.0"],
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      console.log("[connection.update]", {
+        connection,
+        hasQr: !!qr,
+        error: lastDisconnect?.error?.message,
+      });
+
+      if (qr) {
+        try {
+          currentQR = await QRCode.toDataURL(qr, {
+            errorCorrectionLevel: "M",
+            width: 320,
+            margin: 1,
+          });
+          console.log("✅ QR Code gerado");
+        } catch (err) {
+          console.error("Erro ao gerar QR:", err);
+        }
+      }
+
+      if (connection === "open") {
+        isConnected = true;
+        currentQR = null;
+        phoneNumber = sock?.user?.id?.split(":")[0] || null;
+        console.log("✅ WhatsApp conectado:", phoneNumber);
+      }
+
+      if (connection === "close") {
+        isConnected = false;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        console.log("❌ Conexão fechada. Código:", code, "Reconectar?", shouldReconnect);
+        sock = null;
+        if (shouldReconnect) {
+          setTimeout(() => startSock().catch(console.error), 2000);
+        }
+      }
+    });
+  } catch (err) {
+    console.error("Erro em startSock:", err);
+  } finally {
+    starting = false;
+  }
+}
+
+// ---------- Rotas ----------
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "notifyzap-bridge", connected: isConnected });
+});
+
+app.get("/status", checkAuth, (_req, res) => {
   res.json({
-    qr: currentQR,
     connected: isConnected,
     phone: phoneNumber,
+    hasQr: !!currentQR,
   });
 });
 
-// 🔄 Reset — apaga auth/ e força nova sessão (gera QR novo)
-app.post("/session/reset", auth, async (_req, res) => {
+app.post("/session/start", checkAuth, async (_req, res) => {
+  if (isConnected) {
+    return res.json({ connected: true, qr: null, phone: phoneNumber });
+  }
+
+  if (!sock) {
+    startSock().catch(console.error);
+  }
+
+  // Espera até 12s pelo QR ou conexão
+  const start = Date.now();
+  while (Date.now() - start < 12000) {
+    if (isConnected) return res.json({ connected: true, qr: null, phone: phoneNumber });
+    if (currentQR) return res.json({ connected: false, qr: currentQR });
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  res.json({
+    connected: false,
+    qr: currentQR,
+    message: currentQR ? "QR pronto" : "Aguardando geração do QR (tente novamente em alguns segundos)",
+  });
+});
+
+app.post("/session/reset", checkAuth, async (_req, res) => {
+  console.log("🔄 Reset solicitado — limpando sessão");
   try {
     if (sock) {
-      try { await sock.logout(); } catch (e) { /* ignore */ }
+      try { sock.end(); } catch (_) {}
       sock = null;
     }
-    await fs.rm(AUTH_DIR, { recursive: true, force: true });
-    currentQR = null;
     isConnected = false;
+    currentQR = null;
     phoneNumber = null;
-    starting = false;
-    setTimeout(() => startSession(), 500);
-    res.json({ ok: true, message: "Sessão resetada — gerando novo QR" });
+
+    if (fs.existsSync(AUTH_DIR)) {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      console.log("🗑️  Pasta auth/ removida");
+    }
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+    setTimeout(() => startSock().catch(console.error), 1000);
+    res.json({ ok: true, message: "Sessão resetada — reinicializando Baileys" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Erro no reset:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.post("/send", auth, async (req, res) => {
-  const { phone, message } = req.body;
-  if (!sock || !isConnected) {
+app.post("/send", checkAuth, async (req, res) => {
+  const { phone, message } = req.body || {};
+  if (!isConnected || !sock) {
     return res.status(400).json({ error: "WhatsApp não conectado" });
   }
+  if (!phone || !message) {
+    return res.status(400).json({ error: "phone e message são obrigatórios" });
+  }
+
   try {
-    await sock.sendMessage(phone + "@s.whatsapp.net", { text: message });
-    res.json({ status: "sent" });
+    const jid = `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text: message });
+    res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Erro ao enviar:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.get("/status", auth, (_req, res) => {
-  res.json({
-    connected: isConnected,
-    phone: phoneNumber,
-    qr: isConnected ? null : currentQR,
-  });
-});
-
+// ---------- Boot ----------
 app.listen(PORT, () => {
-  console.log("🚀 Bridge rodando na porta", PORT);
-  startSession().catch(console.error);
+  console.log(`🚀 NotifyZap bridge rodando na porta ${PORT}`);
+  startSock().catch(console.error);
 });
