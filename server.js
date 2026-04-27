@@ -1,76 +1,67 @@
 import express from "express";
+import cors from "cors";
 import {
-  makeWASocket,
+  default as makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason,
-  Browsers,
   fetchLatestBaileysVersion,
+  DisconnectReason,
 } from "@whiskeysockets/baileys";
-import QRCode from "qrcode";
+import { Boom } from "@hapi/boom";
 import fs from "fs";
 import path from "path";
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "123456";
-const AUTH_DIR = path.resolve("./auth");
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
+const AUTH_DIR = "./auth";
 
 let sock = null;
 let currentQR = null;
+let qrGeneratedAt = 0;
+let qrStale = false;
 let isConnected = false;
-let phoneNumber = null;
-let starting = false;
-let error405Count = 0;
+let currentPhone = null;
+let isStarting = false;
 
-function checkAuth(req, res, next) {
+// ---------- Auth middleware ----------
+function auth(req, res, next) {
   const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (token !== AUTH_TOKEN) return res.status(401).json({ error: "Unauthorized" });
+  const token = header.replace("Bearer ", "").trim();
+  if (!BRIDGE_TOKEN || token !== BRIDGE_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
   next();
 }
 
-function clearAuthDir() {
-  try {
-    if (fs.existsSync(AUTH_DIR)) {
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      console.log("🗑️  Pasta auth/ removida");
-    }
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
-  } catch (err) {
-    console.error("Erro ao limpar auth:", err);
-  }
-}
-
+// ---------- Start session ----------
 async function startSock() {
-  if (starting) {
-    console.log("[startSock] já está iniciando, ignorando");
+  if (isStarting) {
+    console.log("⏳ startSock já em andamento, ignorando");
     return;
   }
-  starting = true;
+  isStarting = true;
 
   try {
-    if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-
-    // 🔑 BUSCA A VERSÃO MAIS RECENTE DO WHATSAPP
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`📱 Usando WhatsApp v${version.join(".")} (latest: ${isLatest})`);
 
     sock = makeWASocket({
-      auth: state,
       version,
+      auth: state,
       printQRInTerminal: false,
-      browser: Browsers.ubuntu("Chrome"),
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
+      qrTimeout: 60_000,
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
+      browser: ["NotifyZap", "Chrome", "1.0.0"],
     });
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", async (update) => {
+    sock.ev.on("connection.update", (update) => {
       const { connection, lastDisconnect, qr } = update;
       console.log("[update]", {
         connection,
@@ -79,117 +70,130 @@ async function startSock() {
       });
 
       if (qr) {
-        try {
-          currentQR = await QRCode.toDataURL(qr, {
-            errorCorrectionLevel: "M",
-            width: 320,
-            margin: 1,
-          });
-          console.log("✅ QR Code gerado");
-          error405Count = 0;
-        } catch (err) {
-          console.error("Erro ao gerar QR:", err);
-        }
+        currentQR = qr;
+        qrGeneratedAt = Date.now();
+        qrStale = false;
+        console.log("✅ QR Code gerado");
       }
 
       if (connection === "open") {
         isConnected = true;
         currentQR = null;
-        error405Count = 0;
-        phoneNumber = sock?.user?.id?.split(":")[0] || null;
-        console.log("✅ WhatsApp conectado:", phoneNumber);
+        qrStale = false;
+        currentPhone = sock.user?.id?.split(":")[0] || null;
+        console.log(`🟢 Conectado: ${currentPhone}`);
       }
 
       if (connection === "close") {
         isConnected = false;
-        const code = lastDisconnect?.error?.output?.statusCode;
+        const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
         const shouldReconnect = code !== DisconnectReason.loggedOut;
 
-        if (code === 405) {
-          error405Count++;
-          console.log(`❌ Erro 405 (${error405Count}x consecutivos)`);
+        // Mantém o último QR como "stale" para o dashboard ainda exibir algo
+        if (currentQR) qrStale = true;
 
-          if (error405Count >= 3) {
-            console.log("🔥 3x erro 405 — limpando auth/ e reiniciando do zero");
-            clearAuthDir();
-            error405Count = 0;
-          }
-        }
+        console.log(
+          `🔌 Conexão fechada (code=${code}). Reconnect=${shouldReconnect}`
+        );
 
-        sock = null;
         if (shouldReconnect) {
-          setTimeout(() => startSock().catch(console.error), 2000);
+          isStarting = false;
+          setTimeout(() => startSock(), 1500);
+        } else {
+          // logout total — limpa auth
+          try {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+          } catch (e) {}
+          currentQR = null;
+          qrStale = false;
+          isStarting = false;
         }
       }
     });
+
+    isStarting = false;
   } catch (err) {
-    console.error("Erro em startSock:", err);
-  } finally {
-    starting = false;
+    console.error("❌ Erro startSock:", err);
+    isStarting = false;
   }
 }
 
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "notifyzap-bridge", connected: isConnected });
+// ---------- Endpoints ----------
+app.get("/health", (req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
-app.get("/status", checkAuth, (_req, res) => {
-  res.json({ connected: isConnected, phone: phoneNumber, hasQr: !!currentQR });
-});
-
-app.post("/session/start", checkAuth, async (_req, res) => {
-  if (isConnected) return res.json({ connected: true, qr: null, phone: phoneNumber });
-  if (!sock) startSock().catch(console.error);
-
-  const start = Date.now();
-  while (Date.now() - start < 15000) {
-    if (isConnected) return res.json({ connected: true, qr: null, phone: phoneNumber });
-    if (currentQR) return res.json({ connected: false, qr: currentQR });
-    await new Promise((r) => setTimeout(r, 500));
-  }
-
+app.get("/status", auth, (req, res) => {
   res.json({
-    connected: false,
+    connected: isConnected,
+    phone: currentPhone,
     qr: currentQR,
-    error: error405Count > 0 ? `WhatsApp rejeitando handshake (erro 405 ${error405Count}x)` : null,
-    message: currentQR ? "QR pronto" : "Aguardando QR — tente novamente em alguns segundos",
+    hasQr: !!currentQR,
+    qrAge: currentQR ? Date.now() - qrGeneratedAt : 0,
+    qrStale,
   });
 });
 
-app.post("/session/reset", checkAuth, async (_req, res) => {
-  console.log("🔄 Reset solicitado");
+app.post("/session/start", auth, async (req, res) => {
+  if (!sock || (!isConnected && !currentQR)) {
+    startSock();
+  }
+
+  // Aguarda até 8s pelo QR ou conexão
+  const start = Date.now();
+  while (Date.now() - start < 8000) {
+    if (isConnected || currentQR) break;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  res.json({
+    connected: isConnected,
+    phone: currentPhone,
+    qr: currentQR,
+    hasQr: !!currentQR,
+    qrAge: currentQR ? Date.now() - qrGeneratedAt : 0,
+    qrStale,
+  });
+});
+
+app.post("/session/reset", auth, async (req, res) => {
+  console.log("♻️ Reset solicitado");
   try {
     if (sock) {
-      try { sock.end(); } catch (_) {}
+      try {
+        await sock.logout();
+      } catch (e) {}
       sock = null;
     }
-    isConnected = false;
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
     currentQR = null;
-    phoneNumber = null;
-    error405Count = 0;
-    clearAuthDir();
-    setTimeout(() => startSock().catch(console.error), 1000);
-    res.json({ ok: true, message: "Sessão resetada" });
+    qrStale = false;
+    isConnected = false;
+    currentPhone = null;
+    isStarting = false;
+    setTimeout(() => startSock(), 800);
+    res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/send", checkAuth, async (req, res) => {
-  const { phone, message } = req.body || {};
-  if (!isConnected || !sock) return res.status(400).json({ error: "WhatsApp não conectado" });
-  if (!phone || !message) return res.status(400).json({ error: "phone e message obrigatórios" });
-
+app.post("/send", auth, async (req, res) => {
   try {
-    const jid = `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+    const { to, message } = req.body;
+    if (!sock || !isConnected) {
+      return res.status(400).json({ error: "not connected" });
+    }
+    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text: message });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
+// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`🚀 NotifyZap bridge rodando na porta ${PORT}`);
-  startSock().catch(console.error);
+  console.log(`🚀 Bridge rodando na porta ${PORT}`);
+  startSock();
 });
