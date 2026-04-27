@@ -20,15 +20,13 @@ if (!BRIDGE_TOKEN) {
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Estado global
 let sock = null;
 let currentQr = null;
-let connectionState = "disconnected"; // disconnected | connecting | connected
+let connectionState = "disconnected";
 let lastError = null;
 
 const logger = pino({ level: "info" });
 
-// ==================== AUTENTICAÇÃO ====================
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth || auth !== `Bearer ${BRIDGE_TOKEN}`) {
@@ -37,7 +35,6 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// ==================== INICIALIZAÇÃO BAILEYS ====================
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -91,13 +88,6 @@ async function startSock() {
   });
 }
 
-// ==================== UTILS ====================
-function normalizePhone(raw) {
-  const digits = String(raw || "").replace(/\D/g, "");
-  if (digits.length < 10 || digits.length > 15) return null;
-  return digits;
-}
-
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -109,7 +99,6 @@ function withTimeout(promise, ms, label) {
 
 // ==================== ENDPOINTS ====================
 
-// Health — público, sem auth (para checagem rápida)
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -121,7 +110,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// QR Code — protegido
 app.get("/qr", requireAuth, async (req, res) => {
   if (!currentQr) {
     return res.json({
@@ -138,7 +126,6 @@ app.get("/qr", requireAuth, async (req, res) => {
   }
 });
 
-// Status — protegido
 app.get("/status", requireAuth, (req, res) => {
   res.json({
     ok: true,
@@ -148,7 +135,6 @@ app.get("/status", requireAuth, (req, res) => {
   });
 });
 
-// Logout — protegido (força novo QR)
 app.post("/logout", requireAuth, async (req, res) => {
   try {
     if (sock) await sock.logout().catch(() => {});
@@ -161,79 +147,54 @@ app.post("/logout", requireAuth, async (req, res) => {
   }
 });
 
-// ---------- Send (substitua o app.post("/send", ...) atual) ----------
-app.post("/send", auth, async (req, res) => {
+app.post("/send", requireAuth, async (req, res) => {
   try {
     const { to, message } = req.body;
-    if (!sock || !isConnected) {
-      return res.status(400).json({ ok: false, error: "not connected" });
+
+    if (!sock || connectionState !== "connected") {
+      return res.status(400).json({ ok: false, error: "WhatsApp não conectado" });
     }
     if (!to || !message) {
-      return res.status(400).json({ ok: false, error: "to and message required" });
+      return res.status(400).json({ ok: false, error: "to e message são obrigatórios" });
     }
 
-    // 1) Normaliza número: só dígitos
+    // Normaliza: só dígitos
     let digits = String(to).replace(/\D/g, "");
+    if (digits.length < 10 || digits.length > 15) {
+      return res.status(400).json({ ok: false, error: "Número inválido" });
+    }
 
-    // 2) Se for BR (55) e tiver 12 dígitos (55 + DDD + 8), adiciona o "9"
-    //    Ex: 5511964195002 (13) já está ok; 551196419502 (12) -> 5511996419502
+    // BR: adiciona o "9" extra se faltar (55 + DDD + 8 dígitos = 12)
     if (digits.startsWith("55") && digits.length === 12) {
       digits = digits.slice(0, 4) + "9" + digits.slice(4);
     }
 
-    // 3) Pergunta ao WhatsApp se esse número EXISTE de verdade
-    const [check] = await sock.onWhatsApp(digits);
+    // Valida se existe no WhatsApp
+    let check;
+    try {
+      const result = await withTimeout(sock.onWhatsApp(digits), 10_000, "onWhatsApp");
+      check = Array.isArray(result) ? result[0] : null;
+    } catch (err) {
+      console.error("Erro ao validar número:", err.message);
+      return res.status(504).json({ ok: false, error: `Falha ao validar: ${err.message}` });
+    }
+
     if (!check?.exists) {
       console.log(`❌ Número ${digits} não está no WhatsApp`);
       return res.status(400).json({
         ok: false,
+        exists: false,
         error: "Número não está no WhatsApp",
         checked: digits,
       });
     }
 
-    // 4) Usa o JID retornado pelo onWhatsApp (formato oficial)
     const jid = check.jid;
-    const sent = await sock.sendMessage(jid, { text: message });
-    console.log(`✅ Mensagem enviada para ${jid} (id: ${sent?.key?.id})`);
 
-    res.json({
-      ok: true,
-      to: jid,
-      messageId: sent?.key?.id,
-    });
-  } catch (err) {
-    console.error("❌ Erro ao enviar:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-
-    // Valida se o número existe no WhatsApp (timeout 10s)
-    let exists = false;
+    // Envia
+    let sent;
     try {
-      const result = await withTimeout(sock.onWhatsApp(jid), 10_000, "onWhatsApp");
-      exists = Array.isArray(result) && result.length > 0 && result[0]?.exists;
-    } catch (err) {
-      console.error("Erro ao validar número:", err.message);
-      return res.status(504).json({
-        ok: false,
-        error: `Falha ao validar número: ${err.message}`,
-      });
-    }
-
-    if (!exists) {
-      return res.status(400).json({
-        ok: false,
-        exists: false,
-        error: `O número ${digits} não possui WhatsApp.`,
-      });
-    }
-
-    // Envia a mensagem (timeout 30s)
-    let sendResult;
-    try {
-      sendResult = await withTimeout(
+      sent = await withTimeout(
         sock.sendMessage(jid, { text: String(message) }),
         30_000,
         "sendMessage"
@@ -247,28 +208,27 @@ app.post("/send", auth, async (req, res) => {
       });
     }
 
-    if (!sendResult || !sendResult.key) {
+    if (!sent?.key) {
       return res.status(500).json({
         ok: false,
         delivered: false,
-        error: "WhatsApp não retornou confirmação de envio",
+        error: "WhatsApp não retornou confirmação",
       });
     }
 
-    console.log(`✅ Mensagem enviada para ${digits} (id: ${sendResult.key.id})`);
-
+    console.log(`✅ Mensagem enviada para ${jid} (id: ${sent.key.id})`);
     return res.json({
       ok: true,
       delivered: true,
       exists: true,
-      messageId: sendResult.key.id,
-      to: digits,
+      to: jid,
+      messageId: sent.key.id,
     });
   } catch (err) {
     console.error("❌ Erro no /send:", err);
     return res.status(500).json({
       ok: false,
-      error: err?.message || "Erro interno ao enviar mensagem",
+      error: err?.message || "Erro interno ao enviar",
     });
   }
 });
