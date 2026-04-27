@@ -178,17 +178,83 @@ app.post("/session/reset", auth, async (req, res) => {
   }
 });
 
-app.post("/send", auth, async (req, res) => {
+app.post("/send", async (req, res) => {
   try {
-    const { to, message } = req.body;
-    if (!sock || !isConnected) {
-      return res.status(400).json({ error: "not connected" });
+    const { to, phone, message } = req.body;
+    const target = to || phone; // aceita os dois formatos
+
+    if (!target || !message) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos obrigatórios: to (ou phone) e message",
+      });
     }
-    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
-    res.json({ ok: true });
+
+    if (!sock) {
+      return res.status(503).json({
+        ok: false,
+        error: "WhatsApp não conectado. Escaneie o QR Code primeiro.",
+      });
+    }
+
+    // Normaliza: remove tudo que não for dígito
+    const digits = String(target).replace(/\D/g, "");
+    if (digits.length < 10 || digits.length > 15) {
+      return res.status(400).json({
+        ok: false,
+        error: `Número inválido: "${target}". Use DDI+DDD+número (ex: 5511999998888).`,
+      });
+    }
+
+    const jid = `${digits}@s.whatsapp.net`;
+
+    // 🔍 VALIDA se o número está no WhatsApp
+    let exists = false;
+    try {
+      const result = await sock.onWhatsApp(jid);
+      exists = Array.isArray(result) && result.length > 0 && result[0]?.exists;
+    } catch (err) {
+      console.error("Erro ao validar número:", err);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao validar número no WhatsApp",
+      });
+    }
+
+    if (!exists) {
+      return res.status(400).json({
+        ok: false,
+        exists: false,
+        error: `O número ${digits} não possui WhatsApp.`,
+      });
+    }
+
+    // 📤 Envia a mensagem
+    const sendResult = await sock.sendMessage(jid, { text: String(message) });
+
+    if (!sendResult || !sendResult.key) {
+      return res.status(500).json({
+        ok: false,
+        delivered: false,
+        error: "WhatsApp não retornou confirmação de envio",
+      });
+    }
+
+    console.log(`✅ Mensagem enviada para ${digits} (id: ${sendResult.key.id})`);
+
+    return res.json({
+      ok: true,
+      delivered: true,
+      exists: true,
+      messageId: sendResult.key.id,
+      to: digits,
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ Erro no /send:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Erro interno ao enviar mensagem",
+    });
   }
 });
 
